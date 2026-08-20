@@ -73,9 +73,10 @@ def init_db():
             CREATE TABLE IF NOT EXISTS labels (
                 telegram_id INTEGER,
                 address     TEXT,
+                direction   TEXT,
                 name        TEXT,
                 category    TEXT,
-                PRIMARY KEY (telegram_id, address)
+                PRIMARY KEY (telegram_id, address, direction)
             )
         """)
 
@@ -149,22 +150,43 @@ def get_transaction(row_id):
         ).fetchone()
 
 
-def get_label(telegram_id, address):
+def get_label(telegram_id, address, direction):
     with db() as conn:
         return conn.execute(
-            "SELECT * FROM labels WHERE telegram_id = ? AND address = ?",
-            (telegram_id, address),
+            """SELECT * FROM labels
+               WHERE telegram_id = ? AND address = ? AND direction = ?""",
+            (telegram_id, address, direction),
         ).fetchone()
 
 
-def save_label(telegram_id, address, name, category):
+def get_name(telegram_id, address):
+    """A name is per-person, so any direction's row will do."""
+    with db() as conn:
+        row = conn.execute(
+            "SELECT name FROM labels WHERE telegram_id = ? AND address = ?",
+            (telegram_id, address),
+        ).fetchone()
+        return row["name"] if row else None
+
+
+def save_label(telegram_id, address, direction, name, category):
     with db() as conn:
         conn.execute(
-            """INSERT INTO labels (telegram_id, address, name, category)
-               VALUES (?, ?, ?, ?)
-               ON CONFLICT(telegram_id, address) DO UPDATE SET
+            """INSERT INTO labels
+                   (telegram_id, address, direction, name, category)
+               VALUES (?, ?, ?, ?, ?)
+               ON CONFLICT(telegram_id, address, direction) DO UPDATE SET
                    name = excluded.name, category = excluded.category""",
-            (telegram_id, address, name, category),
+            (telegram_id, address, direction, name, category),
+        )
+
+
+def rename(telegram_id, address, name):
+    """Update the name everywhere this address appears."""
+    with db() as conn:
+        conn.execute(
+            "UPDATE labels SET name = ? WHERE telegram_id = ? AND address = ?",
+            (name, telegram_id, address),
         )
 
 
@@ -223,8 +245,8 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Waiting for a name for someone the user just categorised?
     pending = context.user_data.pop("naming", None)
     if pending:
-        address, category = pending
-        save_label(update.effective_user.id, address, text, category)
+        address = pending
+        rename(update.effective_user.id, address, text)
         await update.message.reply_text(
             f"Got it — {text}. I'll label them automatically from now on."
         )
@@ -273,13 +295,16 @@ async def on_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
     line = format_transfer(tx)
     await query.edit_message_text(f"{line}\n{label}")
 
-    save_label(query.from_user.id, tx["counterparty"],
-               short(tx["counterparty"]), code)
+    # Save the label straight away so future transfers auto-label,
+    # whether or not the user ever supplies a name.
+    existing = get_name(query.from_user.id, tx["counterparty"])
+    save_label(query.from_user.id, tx["counterparty"], tx["direction"],
+               existing or short(tx["counterparty"]), code)
 
-    if code in ("own", "ign"):
+    if code in ("own", "ign") or existing:
         return
 
-    context.user_data["naming"] = (tx["counterparty"], code)
+    context.user_data["naming"] = tx["counterparty"]
     await query.message.reply_text(
         f"Name {short(tx['counterparty'])} so I can label them properly:"
     )
@@ -289,11 +314,11 @@ async def report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     telegram_id = update.effective_user.id
     with db() as conn:
         rows = conn.execute(
-            """SELECT category, token, SUM(amount) AS total
+            """SELECT direction, category, token, SUM(amount) AS total
                FROM transactions
                WHERE telegram_id = ? AND category IS NOT NULL
-                 AND category != 'ign'
-               GROUP BY category, token""",
+                 AND category NOT IN ('ign', 'own')
+               GROUP BY direction, category, token""",
             (telegram_id,),
         ).fetchall()
         pending = conn.execute(
@@ -306,11 +331,22 @@ async def report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Nothing recorded yet.")
         return
 
+    income = [r for r in rows if r["direction"] == "in"]
+    spend = [r for r in rows if r["direction"] == "out"]
+
+    def block(title, group, sign):
+        out = [title]
+        for r in group:
+            amount = f"{r['total']:,.4f}".rstrip("0").rstrip(".")
+            out.append(f"  {CATEGORIES.get(r['category'], r['category'])}: "
+                       f"{sign}{amount} {r['token']}")
+        return out
+
     lines = []
-    for r in rows:
-        amount = f"{r['total']:,.4f}".rstrip("0").rstrip(".")
-        lines.append(f"{CATEGORIES.get(r['category'], r['category'])}: "
-                     f"{amount} {r['token']}")
+    if income:
+        lines += block("Money in", income, "+")
+    if spend:
+        lines += block("Money out", spend, "\u2212")
     if pending:
         lines.append(f"\n{pending} transaction(s) still unlabelled")
 
@@ -434,7 +470,8 @@ def extract_transfers(tx, signature, wallet, telegram_id):
 
 async def announce(app, t):
     """Store a transfer and tell the user, with buttons if it's unknown."""
-    known = get_label(t["telegram_id"], t["counterparty"])
+    known = get_label(t["telegram_id"], t["counterparty"], t["direction"])
+    name = get_name(t["telegram_id"], t["counterparty"])
     if known:
         t["category"] = known["category"]
 
@@ -445,13 +482,13 @@ async def announce(app, t):
     if known:
         await app.bot.send_message(
             t["telegram_id"],
-            f"{format_transfer(t, known['name'])}\n{CATEGORIES.get(known['category'], '')}",
+            f"{format_transfer(t, name)}\n{CATEGORIES.get(known['category'], '')}",
         )
         return
 
     await app.bot.send_message(
         t["telegram_id"],
-        format_transfer(t),
+        format_transfer(t, name),
         reply_markup=category_keyboard(row_id, t["direction"]),
     )
 
