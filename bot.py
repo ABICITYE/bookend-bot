@@ -24,6 +24,18 @@ KNOWN_MINTS = {
     "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB": "USDT",
 }
 
+CATEGORIES = {
+    "cli": "Client payment",
+    "ref": "Refund",
+    "con": "Contractor",
+    "exp": "Expense",
+    "own": "My own wallet",
+    "ign": "Ignored",
+}
+
+IN_BUTTONS = ["cli", "ref", "own", "ign"]
+OUT_BUTTONS = ["con", "exp", "own", "ign"]
+
 
 # ---------- storage ----------
 
@@ -45,6 +57,7 @@ def init_db():
         """)
         conn.execute("""
             CREATE TABLE IF NOT EXISTS transactions (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
                 signature    TEXT,
                 telegram_id  INTEGER,
                 direction    TEXT,
@@ -53,12 +66,18 @@ def init_db():
                 counterparty TEXT,
                 timestamp    INTEGER,
                 category     TEXT,
-                PRIMARY KEY (signature, telegram_id, token, counterparty)
+                UNIQUE (signature, telegram_id, token, counterparty)
             )
         """)
-        cols = [r["name"] for r in conn.execute("PRAGMA table_info(users)")]
-        if "last_signature" not in cols:
-            conn.execute("ALTER TABLE users ADD COLUMN last_signature TEXT")
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS labels (
+                telegram_id INTEGER,
+                address     TEXT,
+                name        TEXT,
+                category    TEXT,
+                PRIMARY KEY (telegram_id, address)
+            )
+        """)
 
 
 def get_user(telegram_id):
@@ -102,19 +121,74 @@ def save_cursor(telegram_id, signature):
 
 
 def save_transfer(t):
+    """Insert and return the row id, or None if it was already stored."""
     with db() as conn:
-        conn.execute(
+        cur = conn.execute(
             """INSERT OR IGNORE INTO transactions
                (signature, telegram_id, direction, amount, token,
                 counterparty, timestamp, category)
-               VALUES (?, ?, ?, ?, ?, ?, ?, NULL)""",
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
             (t["signature"], t["telegram_id"], t["direction"], t["amount"],
-             t["token"], t["counterparty"], t["timestamp"]),
+             t["token"], t["counterparty"], t["timestamp"], t.get("category")),
+        )
+        return cur.lastrowid if cur.rowcount else None
+
+
+def set_category(row_id, category):
+    with db() as conn:
+        conn.execute(
+            "UPDATE transactions SET category = ? WHERE id = ?",
+            (category, row_id),
+        )
+
+
+def get_transaction(row_id):
+    with db() as conn:
+        return conn.execute(
+            "SELECT * FROM transactions WHERE id = ?", (row_id,)
+        ).fetchone()
+
+
+def get_label(telegram_id, address):
+    with db() as conn:
+        return conn.execute(
+            "SELECT * FROM labels WHERE telegram_id = ? AND address = ?",
+            (telegram_id, address),
+        ).fetchone()
+
+
+def save_label(telegram_id, address, name, category):
+    with db() as conn:
+        conn.execute(
+            """INSERT INTO labels (telegram_id, address, name, category)
+               VALUES (?, ?, ?, ?)
+               ON CONFLICT(telegram_id, address) DO UPDATE SET
+                   name = excluded.name, category = excluded.category""",
+            (telegram_id, address, name, category),
         )
 
 
 def short(addr):
     return f"{addr[:4]}...{addr[-4:]}" if len(addr) > 10 else addr
+
+
+# ---------- message building ----------
+
+def format_transfer(t, name=None):
+    sign = "+" if t["direction"] == "in" else "−"
+    word = "from" if t["direction"] == "in" else "to"
+    amount = f"{t['amount']:,.4f}".rstrip("0").rstrip(".")
+    who = name or short(t["counterparty"])
+    return f"{sign}{amount} {t['token']} {word} {who}"
+
+
+def category_keyboard(row_id, direction):
+    codes = IN_BUTTONS if direction == "in" else OUT_BUTTONS
+    buttons = [
+        InlineKeyboardButton(CATEGORIES[c], callback_data=f"cat:{row_id}:{c}")
+        for c in codes
+    ]
+    return InlineKeyboardMarkup([buttons[:2], buttons[2:]])
 
 
 # ---------- Telegram handlers ----------
@@ -145,6 +219,17 @@ async def wallet_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
+
+    # Waiting for a name for someone the user just categorised?
+    pending = context.user_data.pop("naming", None)
+    if pending:
+        address, category = pending
+        save_label(update.effective_user.id, address, text, category)
+        await update.message.reply_text(
+            f"Got it — {text}. I'll label them automatically from now on."
+        )
+        return
+
     if not BASE58.match(text):
         await update.message.reply_text(
             "That doesn't look like a Solana address. Paste the full address."
@@ -172,6 +257,66 @@ async def on_currency(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def on_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    _, row_id, code = query.data.split(":")
+    row_id = int(row_id)
+
+    set_category(row_id, code)
+    tx = get_transaction(row_id)
+    if not tx:
+        await query.edit_message_text("That transaction is gone.")
+        return
+
+    label = CATEGORIES[code]
+    line = format_transfer(tx)
+    await query.edit_message_text(f"{line}\n{label}")
+
+    save_label(query.from_user.id, tx["counterparty"],
+               short(tx["counterparty"]), code)
+
+    if code in ("own", "ign"):
+        return
+
+    context.user_data["naming"] = (tx["counterparty"], code)
+    await query.message.reply_text(
+        f"Name {short(tx['counterparty'])} so I can label them properly:"
+    )
+
+
+async def report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    telegram_id = update.effective_user.id
+    with db() as conn:
+        rows = conn.execute(
+            """SELECT category, token, SUM(amount) AS total
+               FROM transactions
+               WHERE telegram_id = ? AND category IS NOT NULL
+                 AND category != 'ign'
+               GROUP BY category, token""",
+            (telegram_id,),
+        ).fetchall()
+        pending = conn.execute(
+            """SELECT COUNT(*) AS n FROM transactions
+               WHERE telegram_id = ? AND category IS NULL""",
+            (telegram_id,),
+        ).fetchone()["n"]
+
+    if not rows and not pending:
+        await update.message.reply_text("Nothing recorded yet.")
+        return
+
+    lines = []
+    for r in rows:
+        amount = f"{r['total']:,.4f}".rstrip("0").rstrip(".")
+        lines.append(f"{CATEGORIES.get(r['category'], r['category'])}: "
+                     f"{amount} {r['token']}")
+    if pending:
+        lines.append(f"\n{pending} transaction(s) still unlabelled")
+
+    await update.message.reply_text("\n".join(lines))
+
+
 # ---------- RPC ----------
 
 async def rpc(client, method, params):
@@ -192,7 +337,7 @@ async def get_new_signatures(client, wallet, until):
     return [r["signature"] for r in result if not r.get("err")]
 
 
-async def get_transaction(client, signature):
+async def fetch_transaction(client, signature):
     return await rpc(client, "getTransaction", [
         signature,
         {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0},
@@ -219,7 +364,7 @@ def native_changes(tx, keys):
             break
         delta = post[i] - pre[i]
         if i == 0:
-            delta += fee          # fee payer: don't count the fee as a transfer
+            delta += fee
         if delta:
             changes[key] = changes.get(key, 0) + delta / 1_000_000_000
     return changes
@@ -240,7 +385,6 @@ def token_changes(tx):
 
 
 def counterparty_for(changes, wallet, delta):
-    """Whoever moved the opposite way by the closest amount."""
     best, best_gap = None, None
     for addr, other in changes.items():
         if addr == wallet or other == 0:
@@ -286,14 +430,31 @@ def extract_transfers(tx, signature, wallet, telegram_id):
     return out
 
 
-def format_transfer(t):
-    sign = "+" if t["direction"] == "in" else "−"
-    word = "from" if t["direction"] == "in" else "to"
-    amount = f"{t['amount']:,.4f}".rstrip("0").rstrip(".")
-    return f"{sign}{amount} {t['token']} {word} {short(t['counterparty'])}"
-
-
 # ---------- watcher ----------
+
+async def announce(app, t):
+    """Store a transfer and tell the user, with buttons if it's unknown."""
+    known = get_label(t["telegram_id"], t["counterparty"])
+    if known:
+        t["category"] = known["category"]
+
+    row_id = save_transfer(t)
+    if row_id is None:
+        return                      # already seen
+
+    if known:
+        await app.bot.send_message(
+            t["telegram_id"],
+            f"{format_transfer(t, known['name'])}\n{CATEGORIES.get(known['category'], '')}",
+        )
+        return
+
+    await app.bot.send_message(
+        t["telegram_id"],
+        format_transfer(t),
+        reply_markup=category_keyboard(row_id, t["direction"]),
+    )
+
 
 async def watch_loop(app):
     async with httpx.AsyncClient() as client:
@@ -314,13 +475,12 @@ async def watch_loop(app):
                     newest = sigs[0]
 
                     if not cursor:
-                        # First run: bookmark only, don't replay history
                         save_cursor(user["telegram_id"], newest)
                         continue
 
                     for sig in reversed(sigs):
                         try:
-                            tx = await get_transaction(client, sig)
+                            tx = await fetch_transaction(client, sig)
                         except Exception as e:
                             print("tx fetch error:", e)
                             continue
@@ -329,13 +489,10 @@ async def watch_loop(app):
                         for t in extract_transfers(
                             tx, sig, wallet, user["telegram_id"]
                         ):
-                            save_transfer(t)
                             try:
-                                await app.bot.send_message(
-                                    user["telegram_id"], format_transfer(t)
-                                )
+                                await announce(app, t)
                             except Exception as e:
-                                print("send error:", e)
+                                print("announce error:", e)
 
                     save_cursor(user["telegram_id"], newest)
             except Exception as e:
@@ -367,7 +524,9 @@ def main():
     )
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("wallet", wallet_cmd))
+    app.add_handler(CommandHandler("report", report_cmd))
     app.add_handler(CallbackQueryHandler(on_currency, pattern=r"^cur:"))
+    app.add_handler(CallbackQueryHandler(on_category, pattern=r"^cat:"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.run_polling()
 
